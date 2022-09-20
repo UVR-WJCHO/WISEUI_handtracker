@@ -1,11 +1,14 @@
 import os
 os.environ["PYOPENGL_PLATFORM"] = "OSMesa"
+import sys
+
 import torch
 from tqdm import tqdm
 import cv2
 import time
 import torchvision.transforms as standard
 
+sys.path.append(os.path.abspath(os.path.dirname(__file__)))     # append current dir to PATH
 from base import Tester
 from config import cfg
 from utils.visualize import *
@@ -83,12 +86,31 @@ class HandTracker():
             self.idx = 0
 
     def run(self, img):
-        img = self.transform(img)
-        img = torch.unsqueeze(img, 0).type(torch.float32)
-        inputs = {'img': img}
+        # input
+        # rgb = np.random.randint(255, size=(640, 480, 3), dtype=np.uint8)
+        # init_data = pil_to_tensor(rgb).cuda()     ~ include ToTensor(), Normalize(*mean_std)
+
+        # need to check below processing available in gpu location. (previously done in cpu area)
+
+
 
         ### crop image ###
 
+        bbox = [bb_x_min, bb_y_min, bbox_size, bbox_size]
+
+        img, img2bb_trans, bb2img_trans, _, _, = \
+            augmentation(img, bbox, 'evaluation', exclude_flip=False)
+
+        meta_info = {
+            'img2bb_trans': np.float32(img2bb_trans),
+            'bb2img_trans': np.float32(bb2img_trans),
+            'root_depth': np.float32(root[2]),
+            'K': np.float32(self.camera_intrinsics)}
+
+
+        # img = self.transform(img)     # already done in server.py
+        img = torch.unsqueeze(img, 0).type(torch.float32)
+        inputs = {'img': img}
 
         if cfg.extra:
             self.extra_hm = generate_extra(self.extra_uvd, self.idx, reinit_num=10)
@@ -99,13 +121,28 @@ class HandTracker():
             outs = self.tester.model(inputs)
 
         outs = {k: v.cpu().numpy() for k, v in outs.items()}
+        # Normalized value to cropped (256, 256) ranged value
         coords_uvd = outs['coords'][0]
-        coords_uvd[:, :2] = (coords_uvd[:, :2] + 1) * cfg.input_img_shape[0] // 2
+        coords_uvd[:, :2] = (coords_uvd[:, :2] + 1) * (cfg.input_img_shape[0] // 2)
+
+        # back to original image
+        coords_uvd, root_depth, img2bb_trans, bb2img_trans, K = \
+            coords_uvd, meta_info['root_depth'], meta_info['img2bb_trans'], meta_info['bb2img_trans'], meta_info['K']
+        coords_uvd[:, 2] = coords_uvd[:, 2] * cfg.depth_box + root_depth
+        coord_uvd_full = coords_uvd.copy()
+        uv1 = np.concatenate((coord_uvd_full[:, :2], np.ones_like(coord_uvd_full[:, :1])), 1)
+        coords_uvd[:, :2] = np.dot(bb2img_trans, uv1.transpose(1, 0)).transpose(1, 0)[:, :2]
 
         if cfg.extra:
             self.extra_uvd = np.copy(coords_uvd[cfg.num_vert:])
 
-        return coords_uvd
+        # If required xyz format
+        # coord_xyz = uvd2xyz(coord_uvd_full, K)
+
+        mesh_uvd = coords_uvd[:cfg.num_vert]
+        joint_uvd = coords_uvd[cfg.num_vert:]
+
+        return mesh_uvd, joint_uvd
 
 
     def get_record(self, img):
