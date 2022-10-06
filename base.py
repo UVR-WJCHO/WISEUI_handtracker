@@ -1,6 +1,6 @@
 import torch
 import os
-from data.dataset import get_dataset
+from data.dataset import load_dataset
 from torch.utils.data import DataLoader
 import torch.optim as optim
 from model import get_model
@@ -32,9 +32,14 @@ class Trainer:
         checkpoint = torch.load(cfg.checkpoint)
         self.logger.info("Loading the model of epoch-{} from {}...".format(checkpoint['last_epoch'], cfg.checkpoint))
         model.load_state_dict(checkpoint['net'])
-        optimizer.load_state_dict(checkpoint['optimizer'])
-        schedule.load_state_dict(checkpoint['schedule'])
-        start_epoch = checkpoint['last_epoch'] + 1
+
+        if not cfg.reInit_optimizer:
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            schedule.load_state_dict(checkpoint['schedule'])
+            start_epoch = checkpoint['last_epoch'] + 1
+        else:
+            start_epoch = 0
+
         self.logger.info('The model is loaded successfully.')
         return start_epoch, model
 
@@ -48,8 +53,13 @@ class Trainer:
         path_checkpoint = os.path.join(cfg.output_root, 'checkpoint', cfg.experiment_name)
         if not os.path.exists(path_checkpoint):
             os.makedirs(path_checkpoint)
-        save_path = os.path.join(path_checkpoint, "checkpoint_epoch[%d_%d].pth" % (epoch, cfg.total_epoch))
+
+        save_path = os.path.join(path_checkpoint, "checkpoint.pth")
         torch.save(save, save_path)
+
+        if not epoch % 10:
+            save_path = os.path.join(path_checkpoint, "checkpoint_epoch[%d_%d].pth" % (epoch, cfg.total_epoch))
+            torch.save(save, save_path)
         self.logger.info('Save checkpoint to {}'.format(save_path))
 
     def get_lr(self):
@@ -59,7 +69,7 @@ class Trainer:
 
     def _make_batch_loader(self):
         self.logger.info("Creating dataset...")
-        dataset = get_dataset(cfg.dataset, 'training')
+        dataset = load_dataset(cfg.dataset, 'training')
         self.batch_loader = DataLoader(dataset,
                                        batch_size=cfg.batch_size,
                                        num_workers=cfg.num_worker,
@@ -93,25 +103,15 @@ class Tester:
         self.logger = setup_logger(output=logfile, name="Evaluation")
         self.logger.info('Start evaluation: %s' % ('eval_' + cfg.experiment_name))
 
-        self._make_model()
-        self._make_batch_loader()
-
     def _make_batch_loader(self):
         self.logger.info("Creating dataset...")
-        self.dataset = get_dataset(cfg.dataset, 'evaluation')
+        self.dataset = load_dataset(cfg.dataset, 'evaluation')
         self.batch_loader = DataLoader(self.dataset,
                                        batch_size=cfg.batch_size,
                                        num_workers=cfg.num_worker,
                                        shuffle=False,
                                        pin_memory=True)
         self.logger.info("The dataset is created successfully.")
-
-    def get_record(self, img):
-        inputs, targets = self.dataset.get_record(img)
-        image = torch.from_numpy(inputs)
-        img = torch.unsqueeze(image, 0).type(torch.float32)
-        inputs = {'img': img}
-        return inputs, targets
 
     def load_model(self, model):
         self.logger.info('Loading the model from {}...'.format(cfg.checkpoint))
@@ -128,8 +128,8 @@ class Tester:
         self.model = model
         self.logger.info("The model is made successfully.")
 
-    def _evaluate(self, outs, meta_info, cur_sample_idx):
-        eval_result = self.dataset.evaluate(outs, meta_info, cur_sample_idx)
+    def _evaluate(self, outs, meta_info):
+        eval_result = self.dataset.evaluate(outs, meta_info)
         return eval_result
 
     def _print_eval_result(self, eval_result):

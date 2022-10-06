@@ -1,6 +1,3 @@
-import os
-os.environ["PYOPENGL_PLATFORM"] = "OSMesa"
-
 import matplotlib
 import cv2
 import pyrender
@@ -57,6 +54,75 @@ def draw_2d_skeleton(image, pose_uv):
 
 
     return skeleton_overlay
+
+def draw_2d_vertex(image, verts_uv):
+    """
+    :param image: H x W x 3
+    :param verts_uv: N x 2
+    :return:
+    """
+
+    skeleton_overlay = image.copy()
+    marker_sz = 1
+
+    for vert in range(verts_uv.shape[0]):
+        point = verts_uv[vert, 0].astype('int32'), verts_uv[vert, 1].astype('int32')
+        cv2.circle(
+            skeleton_overlay, point,
+            radius=marker_sz, color=color_hand_joints[0] * np.array(255), thickness=1,
+            lineType=cv2.CV_AA if cv2.__version__.startswith('2') else cv2.LINE_AA)
+
+    return skeleton_overlay
+
+
+def draw_2d_skeleton_vis(image, pose_uv, vis):
+    """
+    :param image: H x W x 3
+    :param pose_uv: 21 x 2
+    :param vis: 21,
+    wrist,
+    thumb_mcp, thumb_pip, thumb_dip, thumb_tip
+    index_mcp, index_pip, index_dip, index_tip,
+    middle_mcp, middle_pip, middle_dip, middle_tip,
+    ring_mcp, ring_pip, ring_dip, ring_tip,
+    little_mcp, little_pip, little_dip, little_tip
+    :return:
+    """
+    assert pose_uv.shape[0] == 21
+    skeleton_overlay = image.copy()
+    marker_sz = 6
+    line_wd = 3
+    root_ind = 0
+
+    for joint_ind in range(pose_uv.shape[0]):
+        if joint_ind in vis:
+            color_value = [1.0, 0.0, 0.0]
+        else:
+            color_value = [0.4, 0.4, 0.0]
+
+        joint = pose_uv[joint_ind, 0].astype('int32'), pose_uv[joint_ind, 1].astype('int32')
+        cv2.circle(
+            skeleton_overlay, joint,
+            radius=marker_sz, color=color_value * np.array(255), thickness=-1,
+            lineType=cv2.CV_AA if cv2.__version__.startswith('2') else cv2.LINE_AA)
+        if joint_ind == 0:
+            continue
+        elif joint_ind % 4 == 1:
+            root_joint = pose_uv[root_ind, 0].astype('int32'), pose_uv[root_ind, 1].astype('int32')
+            cv2.line(
+                skeleton_overlay, root_joint, joint,
+                color=color_value * np.array(255), thickness=int(line_wd),
+                lineType=cv2.CV_AA if cv2.__version__.startswith('2') else cv2.LINE_AA)
+        else:
+            joint_2 = pose_uv[joint_ind - 1, 0].astype('int32'), pose_uv[joint_ind - 1, 1].astype('int32')
+            cv2.line(
+                skeleton_overlay, joint_2, joint,
+                color=color_value * np.array(255), thickness=int(line_wd),
+                lineType=cv2.CV_AA if cv2.__version__.startswith('2') else cv2.LINE_AA)
+
+
+    return skeleton_overlay
+
 
 def render_mesh_multi_views(img, mesh, face, cam_param):
     # mesh

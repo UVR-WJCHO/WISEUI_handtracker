@@ -19,7 +19,6 @@ class DepthwiseSeparableConv2d(nn.Module):
         out = self.pointwise(out)
         return out
 
-
 class SoftHeatmap(nn.Module):
     def __init__(self, size, kp_num):
         super(SoftHeatmap, self).__init__()
@@ -185,9 +184,116 @@ class SAR(nn.Module):
             return outs
 
 
-class SAR_weight_v3(nn.Module):
+class SAR_frontWeight(nn.Module):
     def __init__(self):
-        super(SAR_weight_v3, self).__init__()
+        super(SAR_frontWeight, self).__init__()
+        mano = MANO()
+        backbone = models.__dict__[cfg.backbone](pretrained=True)
+        self.extract_mid = nn.Sequential(backbone.conv1, backbone.bn1, backbone.relu,
+                                         backbone.maxpool, backbone.layer1, backbone.layer2)
+
+        self.extract_prev = nn.Sequential(nn.Conv2d(1, 16, kernel_size=7, stride=2, padding=3, bias=False),
+                                           nn.BatchNorm2d(16), nn.LeakyReLU(0.1),
+                                           nn.Conv2d(16, 32, kernel_size=5, stride=1, padding=2, bias=False),
+                                           nn.BatchNorm2d(32), nn.LeakyReLU(0.1))
+        # self.extract_prev : (batch, 1, 64, 64) to (batch, 32, 32, 32)
+
+        self.fuse_latent = nn.Sequential(nn.Conv2d(backbone.fc.in_features // 4 + 32, 32, 1),       # backbone.fc.in_features : 512
+                                         nn.BatchNorm2d(32), nn.LeakyReLU(0.1))
+        self.extract_weight = nn.Sequential(nn.Conv2d(32, 16, kernel_size=5, stride=2, padding=2, bias=False),
+                                           nn.BatchNorm2d(16), nn.LeakyReLU(0.1),
+                                           nn.MaxPool2d(4),
+                                           nn.Conv2d(16, 1, kernel_size=5, stride=2, padding=2, bias=False),
+                                           nn.BatchNorm2d(1), nn.LeakyReLU(0.1),
+                                           nn.MaxPool2d(2))
+
+
+        self.extract_high = []
+        self.saigb = []
+        self.gbbmr = []
+        self.fuse = []
+
+        for i in range(cfg.num_stage):
+            backbone = models.__dict__[cfg.backbone](pretrained=True)
+            channel = backbone.fc.in_features
+            self.extract_high.append(nn.Sequential(backbone.layer3, backbone.layer4))
+
+            self.saigb.append(SAIGB(channel, cfg.num_FMs, cfg.feature_size, cfg.num_vert, mano.template))
+            self.gbbmr.append(GBBMR(cfg.num_FMs * cfg.feature_size + 3, cfg.num_vert, cfg.num_joint, cfg.heatmap_size))
+
+        # fuse net for refinement
+        self.fuse.append(nn.Conv2d(channel // 4 + 32, channel // 4, 1))
+        self.fuse.append(nn.Conv2d(channel // 4 + cfg.num_joint * 2, channel // 4, 1))
+
+        self.extract_high = nn.ModuleList(self.extract_high)
+        self.saigb = nn.ModuleList(self.saigb)
+        self.gbbmr = nn.ModuleList(self.gbbmr)
+        self.fuse = nn.ModuleList(self.fuse)
+
+        self.coord_loss = nn.L1Loss()
+        self.normal_loss = NormalVectorLoss(mano.face)
+        self.edge_loss = EdgeLengthLoss(mano.face)
+        self.weight_loss = nn.L1Loss()
+
+
+
+    def forward(self, input, target=None, dataset=None):
+        prev_heatmap = input['extra'].to(cfg.device)  # check extra : (batch, 1, 64, 64) ~ latentheatmap + depthmap
+        x = input['img'].to(cfg.device)     # x : (batch, 3, 256, 256)
+
+        outs = {'coords': []}
+        lhms = []
+        dms = []
+
+        feat_mid = self.extract_mid(x)  # feat_mid : (batch, 128, 32, 32)
+
+        feat_prev = self.extract_prev(prev_heatmap)  # feat_prev : (batch, 32, 32, 32)
+        feat_latent = self.fuse_latent(torch.cat((feat_mid, feat_prev), dim=1))    # feat_latent : (batch, 32, 32, 32)
+        feat_weight = self.extract_weight(feat_latent)
+
+        feat_latent = feat_latent * feat_weight.expand_as(feat_latent)
+
+        feat_mid = self.fuse[0](torch.cat((feat_mid, feat_latent), dim=1))
+        for i in range(cfg.num_stage):
+            if i > 0:
+                feat = self.fuse[i](
+                    torch.cat((feat_mid,
+                               lhms[i - 1][:, cfg.num_vert:],
+                               dms[i - 1][:, cfg.num_vert:]), dim=1))   # 128 + 42 + 32
+            else:
+                feat = feat_mid
+
+            feat_high = self.extract_high[i](feat)  # (batch, 128, 32, 32) >> (batch, 512, 8, 8)
+            init_graph = self.saigb[i](feat_high)  # (batch, 778, 515)
+            coord, lhm, dm = self.gbbmr[i](init_graph)
+
+            outs['coords'].append(coord)  # coord : (batch, 799, 3)      # 799 = num_vert(778) + num_joint(21)
+            lhms.append(lhm)  # lhm : (batch, 799, 32, 32)
+            dms.append(dm)  # dms : (batch, 799, 32, 32)
+
+        if self.training:
+            loss = {}
+            mesh_pose_uvd = target['mesh_pose_uvd'].to(cfg.device)
+            sim_scale = target['weight_aug'].to(cfg.device)  # w = 0 if same, noise scale 1~2.5, ...
+            weight_sim = 1.0 / (sim_scale * 2.0 + 1.0)  # 1 if same, smaller if different
+
+            for i in range(cfg.num_stage):
+                loss['coord_{}'.format(i)] = self.coord_loss(outs['coords'][i], mesh_pose_uvd)
+                loss['normal_{}'.format(i)] = \
+                    self.normal_loss(outs['coords'][i][:, :cfg.num_vert], mesh_pose_uvd[:, :cfg.num_vert]).mean() * 0.1
+                loss['edge_{}'.format(i)] = \
+                    self.edge_loss(outs['coords'][i][:, :cfg.num_vert], mesh_pose_uvd[:, :cfg.num_vert]).mean()
+            loss['weight'] = self.weight_loss(feat_weight, weight_sim)
+            return loss #, outs['coords'][-1]
+        else:
+            debug = None
+            outs['coords'] = outs['coords'][-1]
+
+            return outs #, debug
+
+class SAR_refineWeight(nn.Module):
+    def __init__(self):
+        super(SAR_refineWeight, self).__init__()
         mano = MANO()
         backbone = models.__dict__[cfg.backbone](pretrained=True)
 
@@ -311,57 +417,468 @@ class SAR_weight_v3(nn.Module):
             if flag_exist:
                 loss['heatmap'] *= 0.2
 
-            return loss, outs['coords'][-1]
+            return loss     #, outs['coords'][-1]
 
         else:
-            debug = None
             outs['coords'] = outs['coords'][-1]
+            return outs
 
-            return outs #, debug
+class SAR_crossWeight(nn.Module):
+    def __init__(self):
+        super(SAR_crossWeight, self).__init__()
+        mano = MANO()
+        backbone = models.__dict__[cfg.backbone](pretrained=True)
 
-    def create_relative(self, joint_uvd):
-        # 3D dist. of wrist to each joint (n=20)
-        for i in range(20):
-            diff = torch.subtract(joint_uvd[:, 0, :], joint_uvd[:, i + 1, :])
+        self.depthwiseConv2d_0 = DepthwiseSeparableConv2d(64, 16, 4)
+        self.depthwiseConv2d_1 = DepthwiseSeparableConv2d(16, 4, 2)
+        self.depthwiseConv2d_2 = DepthwiseSeparableConv2d(4, 1, 2)
+
+        self.extract_mid = nn.Sequential(backbone.conv1, backbone.bn1, backbone.relu,
+                                         backbone.maxpool, backbone.layer1, backbone.layer2)
+
+        self.extract_prev_heatmap = nn.Sequential(nn.Conv2d(1, 16, kernel_size=7, stride=2, padding=3, bias=False),
+                                           nn.BatchNorm2d(16), nn.LeakyReLU(0.1),
+                                           nn.Conv2d(16, 21, kernel_size=5, stride=1, padding=2, bias=False),
+                                           nn.BatchNorm2d(21), nn.LeakyReLU(0.1))
+
+        # self.extract_prev : (batch, 21, 32, 32) to (batch, 32, 32, 32)
+        #self.extract_prev_featuremap = nn.Sequential(nn.Conv2d(21, 32, 1), nn.BatchNorm2d(32), nn.LeakyReLU(0.1))
+
+        self.fuse_latent = nn.Sequential(nn.Conv2d(backbone.fc.in_features // 4 + 21, 64, 1),       # backbone.fc.in_features : 512
+                                         nn.BatchNorm2d(64), nn.LeakyReLU(0.1))
+
+        self.extract_weight = nn.Sequential(self.depthwiseConv2d_0,
+                                            nn.Conv2d(16, 16, kernel_size=5, stride=4, padding=2, bias=False),
+                                           nn.BatchNorm2d(16), nn.LeakyReLU(0.1),   #  (16, 8, 8)
+                                            self.depthwiseConv2d_1,
+                                           nn.Conv2d(4, 4, kernel_size=5, stride=4, padding=2, bias=False),
+                                           nn.BatchNorm2d(4), nn.LeakyReLU(0.1),    # (4, 2, 2)
+                                            self.depthwiseConv2d_2,
+                                            nn.Conv2d(1, 1, kernel_size=3, stride=2, padding=1, bias=False),
+                                            nn.BatchNorm2d(1), nn.LeakyReLU(0.1))     # (1, 2, 2) > (1, 1, 1)
+
+
+        self.extract_high = []
+        self.saigb = []
+        self.gbbmr = []
+        self.fuse = []
+
+        for i in range(cfg.num_stage):
+            backbone = models.__dict__[cfg.backbone](pretrained=True)
+            channel = backbone.fc.in_features
+            self.extract_high.append(nn.Sequential(backbone.layer3, backbone.layer4))
+
+            self.saigb.append(SAIGB(channel, cfg.num_FMs, cfg.feature_size, cfg.num_vert, mano.template))
+            self.gbbmr.append(GBBMR(cfg.num_FMs * cfg.feature_size + 3, cfg.num_vert, cfg.num_joint, cfg.heatmap_size))
+
+        # fuse net for refinement
+        self.fuse.append(nn.Conv2d(channel // 4 + 21, channel // 4, 1))
+        self.fuse.append(nn.Conv2d(channel // 4 + cfg.num_joint * 2 + 21, channel // 4, 1))
+
+        self.extract_high = nn.ModuleList(self.extract_high)
+        self.saigb = nn.ModuleList(self.saigb)
+        self.gbbmr = nn.ModuleList(self.gbbmr)
+        self.fuse = nn.ModuleList(self.fuse)
+
+        self.coord_loss = nn.L1Loss()
+        self.normal_loss = NormalVectorLoss(mano.face)
+        self.edge_loss = EdgeLengthLoss(mano.face)
+        self.weight_loss = nn.MSELoss()
+        self.heatmap_loss = nn.MSELoss()
+
+
+    def forward(self, input, target=None, dataset=None):
+        prev_source = input['extra'].to(cfg.device)  # check extra : (batch, 1, 64, 64) ~ latentheatmap + depthmap
+        x = input['img'].to(cfg.device)     # x : (batch, 3, 256, 256)
+
+        outs = {'coords': []}
+        lhms = []
+        dms = []
+
+        feat_mid = self.extract_mid(x)  # feat_mid : (batch, 128, 32, 32)
+
+        prev_heatmap = self.extract_prev_heatmap(prev_source)  # prev_heatmap : (batch, 21, 32, 32)
+        feat_latent = self.fuse_latent(torch.cat((feat_mid, prev_heatmap), dim=1))    # feat_latent : (batch, 64, 32, 32)
+        feat_weight = self.extract_weight(feat_latent)
+
+        for i in range(cfg.num_stage):
             if i is 0:
-                curr_rel = torch.unsqueeze(torch.sum(torch.abs(diff), dim=1), dim=1)
+                feat = self.fuse[i](
+                    torch.cat((feat_mid,
+                               prev_heatmap), dim=1))   # 128 + 21
             else:
-                feat = torch.unsqueeze(torch.sum(torch.abs(diff), dim=1), dim=1)
-                curr_rel = torch.cat([curr_rel, feat], dim=1)
+                prev_heatmap_weighted = torch.mul(prev_heatmap, feat_weight.expand_as(prev_heatmap))
 
-        # # 3D dist. of finger root to finger joint  for each finger (n=3*5)
-        # for finger in range(5):
-        #     for idx in range(3):
-        #         diff = torch.subtract(joint_uvd[:, finger * 4 + 1, :], joint_uvd[:, finger * 4 + 1 + (idx + 1), :])
-        #         feat = torch.unsqueeze(torch.sum(torch.abs(diff), dim=1), dim=1)
-        #         curr_rel = torch.cat([curr_rel, feat], dim=1)
+                feat = self.fuse[i](
+                    torch.cat((feat_mid,
+                               lhms[i - 1][:, cfg.num_vert:],
+                               dms[i - 1][:, cfg.num_vert:],
+                               prev_heatmap_weighted), dim=1))  # 128 + 42 + 21
 
-        # 3D dist. of adjacent finger joint(n=4*4)
-        for finger in range(4):
-            for idx in range(4):
-                diff = torch.subtract(joint_uvd[:, finger * 4 + 1 + idx, :], joint_uvd[:, (finger + 1) * 4 + 1 + idx, :])
-                feat = torch.unsqueeze(torch.sum(torch.abs(diff), dim=1), dim=1)
-                curr_rel = torch.cat([curr_rel, feat], dim=1)
+            feat_high = self.extract_high[i](feat)  # (batch, 128, 32, 32) >> (batch, 512, 8, 8)
+            init_graph = self.saigb[i](feat_high)  # (batch, 778, 515)
+            coord, lhm, dm = self.gbbmr[i](init_graph)
 
-        curr_rel /= 3.0
+            outs['coords'].append(coord)  # coord : (batch, 799, 3)      # 799 = num_vert(778) + num_joint(21)
+            lhms.append(lhm)  # lhm : (batch, 799, 32, 32)
+            dms.append(dm)  # dms : (batch, 799, 32, 32)
 
-        # for i in range(20):
-        #     diff = torch.subtract(joint_uvd[:, 0, :], joint_uvd[:, i + 1, :])
-        #     if i is 0:
-        #         curr_rel = torch.unsqueeze(torch.sum(torch.abs(diff), dim=1), dim=1)
-        #     else:
-        #         feat = torch.unsqueeze(torch.sum(torch.abs(diff), dim=1), dim=1)
-        #         curr_rel = torch.cat([curr_rel, feat], dim=1)
-        # curr_rel /= 2.0
+            joint_lhm = lhm[:, cfg.num_vert:, :, :].clone().detach()
 
-        return curr_rel
+        if self.training:
+            loss = {}
+            mesh_pose_uvd = target['mesh_pose_uvd'].to(cfg.device)
+            weight_sim = target['weight_aug'].to(cfg.device)  # w = 1 if optimal feature(same as currGT), w < 1 as noise scale, ...
+
+            for i in range(cfg.num_stage):
+                loss['coord_{}'.format(i)] = self.coord_loss(outs['coords'][i], mesh_pose_uvd)
+                loss['normal_{}'.format(i)] = \
+                    self.normal_loss(outs['coords'][i][:, :cfg.num_vert], mesh_pose_uvd[:, :cfg.num_vert]).mean() * 0.1
+                loss['edge_{}'.format(i)] = \
+                    self.edge_loss(outs['coords'][i][:, :cfg.num_vert], mesh_pose_uvd[:, :cfg.num_vert]).mean()
+            loss['weight'] = self.weight_loss(torch.squeeze(feat_weight), torch.squeeze(weight_sim))
+
+            flag_exist = False
+            for i in range(cfg.batch_size):
+                if torch.eq(weight_sim[i], 1.0):
+                    if not flag_exist:
+                        flag_exist = True
+                        loss['heatmap'] = self.heatmap_loss(prev_heatmap[i], joint_lhm[i])
+                    else:
+                        loss['heatmap'] += self.heatmap_loss(prev_heatmap[i], joint_lhm[i])
+
+            if flag_exist:
+                loss['heatmap'] *= 0.2
+
+            return loss     #, outs['coords'][-1]
+
+        else:
+            outs['coords'] = outs['coords'][-1]
+            return outs
+
+class SAR_crossWeight_wVis(nn.Module):
+    def __init__(self):
+        super(SAR_crossWeight_wVis, self).__init__()
+        mano = MANO()
+        backbone = models.__dict__[cfg.backbone](pretrained=True)
+
+        self.depthwiseConv2d_0 = DepthwiseSeparableConv2d(64, 16, 4)
+        self.depthwiseConv2d_1 = DepthwiseSeparableConv2d(16, 4, 2)
+        self.depthwiseConv2d_2 = DepthwiseSeparableConv2d(4, 1, 2)
+
+        self.depthwiseConv2d_3 = DepthwiseSeparableConv2d(32, 8, 4)
+
+        self.extract_mid = nn.Sequential(backbone.conv1, backbone.bn1, backbone.relu,
+                                         backbone.maxpool, backbone.layer1, backbone.layer2)
+
+        self.extract_prev_heatmap = nn.Sequential(nn.Conv2d(1, 16, kernel_size=7, stride=2, padding=3, bias=False),
+                                           nn.BatchNorm2d(16), nn.LeakyReLU(0.1),
+                                           nn.Conv2d(16, 21, kernel_size=5, stride=1, padding=2, bias=False),
+                                           nn.BatchNorm2d(21), nn.LeakyReLU(0.1))
+
+        # self.extract_prev : (batch, 21, 32, 32) to (batch, 32, 32, 32)
+        #self.extract_prev_featuremap = nn.Sequential(nn.Conv2d(21, 32, 1), nn.BatchNorm2d(32), nn.LeakyReLU(0.1))
+
+        self.fuse_latent = nn.Sequential(nn.Conv2d(backbone.fc.in_features // 4 + 21, 64, 1),       # backbone.fc.in_features : 512
+                                         nn.BatchNorm2d(64), nn.LeakyReLU(0.1))
+
+        self.extract_weight = nn.Sequential(self.depthwiseConv2d_0,
+                                            nn.Conv2d(16, 16, kernel_size=5, stride=4, padding=2, bias=False),
+                                           nn.BatchNorm2d(16), nn.LeakyReLU(0.1),   #  (16, 8, 8)
+                                            self.depthwiseConv2d_1,
+                                           nn.Conv2d(4, 4, kernel_size=5, stride=4, padding=2, bias=False),
+                                           nn.BatchNorm2d(4), nn.LeakyReLU(0.1),    # (4, 2, 2)
+                                            self.depthwiseConv2d_2,
+                                            nn.Conv2d(1, 1, kernel_size=3, stride=2, padding=1, bias=False),
+                                            nn.BatchNorm2d(1), nn.LeakyReLU(0.1))     # (1, 2, 2) > (1, 1, 1)
+
+        self.extract_visib = nn.Sequential(nn.Conv2d(backbone.fc.in_features // 4, 32, 1),
+                                           nn.BatchNorm2d(32), nn.LeakyReLU(0.1),
+                                           self.depthwiseConv2d_3,
+                                           nn.Conv2d(8, 4, kernel_size=5, stride=4, padding=2, bias=False),    #(4, 4, 4)
+                                           nn.Conv2d(4, 1, kernel_size=5, stride=4, padding=2, bias=False),
+                                           nn.BatchNorm2d(1), nn.LeakyReLU(0.1))        # (batch, 256, 16, 16) >> (batch, 1)
+
+        self.extract_high_0 = []
+        self.extract_high_1 = []
+        self.saigb = []
+        self.gbbmr = []
+        self.fuse = []
+
+        for i in range(cfg.num_stage):
+            backbone = models.__dict__[cfg.backbone](pretrained=True)
+            channel = backbone.fc.in_features
+            self.extract_high_0.append(nn.Sequential(backbone.layer3))
+            self.extract_high_1.append(nn.Sequential(backbone.layer4))
+
+            self.saigb.append(SAIGB(channel, cfg.num_FMs, cfg.feature_size, cfg.num_vert, mano.template))
+            self.gbbmr.append(GBBMR(cfg.num_FMs * cfg.feature_size + 3, cfg.num_vert, cfg.num_joint, cfg.heatmap_size))
+
+        # fuse net for refinement
+        self.fuse.append(nn.Conv2d(channel // 4 + 21, channel // 4, 1))
+        self.fuse.append(nn.Conv2d(channel // 4 + cfg.num_joint * 2 + 21, channel // 4, 1))
+
+        self.extract_high_0 = nn.ModuleList(self.extract_high_0)
+        self.extract_high_1 = nn.ModuleList(self.extract_high_1)
+        self.saigb = nn.ModuleList(self.saigb)
+        self.gbbmr = nn.ModuleList(self.gbbmr)
+        self.fuse = nn.ModuleList(self.fuse)
+
+        self.coord_loss = nn.L1Loss()
+        self.normal_loss = NormalVectorLoss(mano.face)
+        self.edge_loss = EdgeLengthLoss(mano.face)
+        self.weight_loss = nn.MSELoss()
+        self.heatmap_loss = nn.MSELoss()
+
+
+    def forward(self, input, target=None, dataset=None):
+        prev_source = input['extra'].to(cfg.device)  # check extra : (batch, 1, 64, 64) ~ latentheatmap + depthmap
+        x = input['img'].to(cfg.device)     # x : (batch, 3, 256, 256)
+
+        if cfg.flag_vis:
+            visib = input['visible'].to(cfg.device)
+
+        outs = {'coords': []}
+        lhms = []
+        dms = []
+
+        feat_mid = self.extract_mid(x)  # feat_mid : (batch, 128, 32, 32)
+
+        prev_heatmap = self.extract_prev_heatmap(prev_source)  # prev_heatmap : (batch, 21, 32, 32)
+
+        feat_latent = self.fuse_latent(torch.cat((feat_mid, prev_heatmap), dim=1))    # feat_latent : (batch, 64, 32, 32)
+        feat_weight = self.extract_weight(feat_latent)
+
+        for i in range(cfg.num_stage):
+            if i is 0:
+                feat = self.fuse[i](
+                    torch.cat((feat_mid,
+                               prev_heatmap), dim=1))   # 128 + 21
+                feat_high_0 = self.extract_high_0[i](feat)      # (batch, 128, 32, 32) >> (batch, 256, 16, 16)
+
+                if cfg.flag_vis:
+                    feat_visib = self.extract_visib(feat_high_0)     # 1 if all visible, close to 0 if occluded
+                    feat_weight = torch.mul(feat_weight, (1. / feat_visib))
+
+            else:
+                prev_heatmap_weighted = torch.mul(prev_heatmap, feat_weight.expand_as(prev_heatmap))
+
+                feat = self.fuse[i](
+                    torch.cat((feat_mid,
+                               lhms[i - 1][:, cfg.num_vert:],
+                               dms[i - 1][:, cfg.num_vert:],
+                               prev_heatmap_weighted), dim=1))  # 128 + 42 + 21
+                feat_high_0 = self.extract_high_0[i](feat)  # (batch, 128, 32, 32) >> (batch, 256, 16, 16)
+
+            feat_high = self.extract_high_1[i](feat_high_0) # (batch, 512, 8, 8)
+            init_graph = self.saigb[i](feat_high)  # (batch, 778, 515)
+            coord, lhm, dm = self.gbbmr[i](init_graph)
+
+            outs['coords'].append(coord)  # coord : (batch, 799, 3)      # 799 = num_vert(778) + num_joint(21)
+            lhms.append(lhm)  # lhm : (batch, 799, 32, 32)
+            dms.append(dm)  # dms : (batch, 799, 32, 32)
+
+            joint_lhm = lhm[:, cfg.num_vert:, :, :].clone().detach()
+
+        if self.training:
+            loss = {}
+            mesh_pose_uvd = target['mesh_pose_uvd'].to(cfg.device)
+            weight_sim = target['weight_aug'].to(cfg.device)  # w = 1 if optimal feature(same as currGT), w < 1 as noise scale, ...
+
+            for i in range(cfg.num_stage):
+                loss['coord_{}'.format(i)] = self.coord_loss(outs['coords'][i], mesh_pose_uvd)
+                loss['normal_{}'.format(i)] = \
+                    self.normal_loss(outs['coords'][i][:, :cfg.num_vert], mesh_pose_uvd[:, :cfg.num_vert]).mean() * 0.1
+                loss['edge_{}'.format(i)] = \
+                    self.edge_loss(outs['coords'][i][:, :cfg.num_vert], mesh_pose_uvd[:, :cfg.num_vert]).mean()
+
+            loss['weight'] = self.weight_loss(feat_weight, weight_sim)
+            if cfg.flag_vis:
+                loss['visib'] = self.weight_loss(feat_visib, visib)
+
+            flag_exist = False
+            for i in range(cfg.batch_size):
+                if torch.eq(weight_sim[i], 1.0):
+                    if not flag_exist:
+                        flag_exist = True
+                        loss['heatmap'] = self.heatmap_loss(prev_heatmap[i], joint_lhm[i])
+                    else:
+                        loss['heatmap'] += self.heatmap_loss(prev_heatmap[i], joint_lhm[i])
+            if flag_exist:
+                loss['heatmap'] *= 0.2
+
+            return loss #, outs['coords'][-1]
+
+        else:
+            outs['coords'] = outs['coords'][-1]
+            return outs
+
+
+class SAR_crossWeight_wVis_light(nn.Module):
+    def __init__(self):
+        super(SAR_crossWeight_wVis_light, self).__init__()
+        mano = MANO()
+        backbone = models.__dict__[cfg.backbone](pretrained=True)
+
+        self.depthwiseConv2d_0 = DepthwiseSeparableConv2d(64, 16, 4)
+        self.depthwiseConv2d_1 = DepthwiseSeparableConv2d(16, 4, 2)
+        self.depthwiseConv2d_2 = DepthwiseSeparableConv2d(4, 1, 2)
+
+        self.depthwiseConv2d_3 = DepthwiseSeparableConv2d(32, 4, 2)
+
+        self.extract_mid = nn.Sequential(backbone.conv1, backbone.bn1, backbone.relu,
+                                         backbone.maxpool, backbone.layer1, backbone.layer2)
+
+        self.extract_prev_heatmap = nn.Sequential(nn.Conv2d(1, 16, kernel_size=7, stride=2, padding=3, bias=False),
+                                           nn.BatchNorm2d(16), nn.LeakyReLU(0.1),
+                                           nn.Conv2d(16, 21, kernel_size=5, stride=1, padding=2, bias=False),
+                                           nn.BatchNorm2d(21), nn.LeakyReLU(0.1))
+
+        # self.extract_prev : (batch, 21, 32, 32) to (batch, 32, 32, 32)
+        #self.extract_prev_featuremap = nn.Sequential(nn.Conv2d(21, 32, 1), nn.BatchNorm2d(32), nn.LeakyReLU(0.1))
+
+        self.fuse_latent = nn.Sequential(nn.Conv2d(backbone.fc.in_features // 4 + 21, 64, 1),       # backbone.fc.in_features : 512
+                                         nn.BatchNorm2d(64), nn.LeakyReLU(0.1))
+
+        self.extract_weight = nn.Sequential(self.depthwiseConv2d_0, # (16, 32, 32)
+                                            nn.MaxPool2d(4), nn.BatchNorm2d(16), nn.LeakyReLU(0.1),   #  (16, 8, 8)
+                                            self.depthwiseConv2d_1, nn.MaxPool2d(2),# (4, 4, 4)
+                                            self.depthwiseConv2d_2, nn.AvgPool2d(4),
+                                            nn.BatchNorm2d(1), nn.LeakyReLU(0.1))     # (1, 2, 2) > (1, 1, 1)
+
+        self.extract_visib = nn.Sequential(nn.Conv2d(backbone.fc.in_features // 2, 32, 1),
+                                           nn.BatchNorm2d(32), nn.LeakyReLU(0.1),
+                                           self.depthwiseConv2d_3,  # (4, 16, 16)
+                                           nn.MaxPool2d(4),    #(4, 4, 4)
+                                           nn.Conv2d(4, 1, kernel_size=3, stride=2, padding=1, bias=False), nn.AvgPool2d(2),
+                                           nn.BatchNorm2d(1), nn.LeakyReLU(0.1))        # (batch, 256, 16, 16) >> (batch, 1)
+
+        self.extract_high_0 = []
+        self.extract_high_1 = []
+        self.saigb = []
+        self.gbbmr = []
+        self.fuse = []
+
+        for i in range(cfg.num_stage):
+            backbone = models.__dict__[cfg.backbone](pretrained=True)
+            channel = backbone.fc.in_features
+            self.extract_high_0.append(nn.Sequential(backbone.layer3))
+            self.extract_high_1.append(nn.Sequential(backbone.layer4))
+
+            self.saigb.append(SAIGB(channel, cfg.num_FMs, cfg.feature_size, cfg.num_vert, mano.template))
+            self.gbbmr.append(GBBMR(cfg.num_FMs * cfg.feature_size + 3, cfg.num_vert, cfg.num_joint, cfg.heatmap_size))
+
+        # fuse net for refinement
+        self.fuse.append(nn.Conv2d(channel // 4 + 21, channel // 4, 1))
+        self.fuse.append(nn.Conv2d(channel // 4 + cfg.num_joint * 2 + 21, channel // 4, 1))
+
+        self.extract_high_0 = nn.ModuleList(self.extract_high_0)
+        self.extract_high_1 = nn.ModuleList(self.extract_high_1)
+        self.saigb = nn.ModuleList(self.saigb)
+        self.gbbmr = nn.ModuleList(self.gbbmr)
+        self.fuse = nn.ModuleList(self.fuse)
+
+        self.coord_loss = nn.L1Loss()
+        self.normal_loss = NormalVectorLoss(mano.face)
+        self.edge_loss = EdgeLengthLoss(mano.face)
+        self.weight_loss = nn.MSELoss()
+        self.heatmap_loss = nn.MSELoss()
+
+        self.pi = torch.acos(torch.zeros(1)).item() * 2
+
+
+    def forward(self, input, target=None, dataset=None):
+        prev_source = input['extra'].to(cfg.device)  # check extra : (batch, 1, 64, 64) ~ latentheatmap + depthmap
+        x = input['img'].to(cfg.device)     # x : (batch, 3, 256, 256)
+
+        outs = {'coords': []}
+        lhms = []
+        dms = []
+
+        feat_mid = self.extract_mid(x)  # feat_mid : (batch, 128, 32, 32)
+
+        prev_heatmap = self.extract_prev_heatmap(prev_source)  # prev_heatmap : (batch, 21, 32, 32)
+
+        feat_latent = self.fuse_latent(torch.cat((feat_mid, prev_heatmap), dim=1))    # feat_latent : (batch, 64, 32, 32)
+        feat_weight = self.extract_weight(feat_latent)
+
+        for i in range(cfg.num_stage):
+            if i is 0:
+                feat = self.fuse[i](
+                    torch.cat((feat_mid,
+                               prev_heatmap), dim=1))   # 128 + 21
+                feat_high_0 = self.extract_high_0[i](feat)      # (batch, 128, 32, 32) >> (batch, 256, 16, 16)
+
+                if cfg.flag_vis:
+                    feat_visib = self.extract_visib(feat_high_0)     # 1 if all visible, close to 0 if occluded
+                    # feat_weight = torch.mul(feat_weight, (1. / (1. + torch.abs(feat_visib) * 5.)))
+
+                    feat_visib_norm = 2. * torch.cos(self.pi * torch.abs(feat_visib) / 2.)
+                    feat_weight = torch.mul(feat_weight, feat_visib_norm)
+
+            else:
+                prev_heatmap_weighted = torch.mul(prev_heatmap, feat_weight.expand_as(prev_heatmap))
+
+                feat = self.fuse[i](
+                    torch.cat((feat_mid,
+                               lhms[i - 1][:, cfg.num_vert:],
+                               dms[i - 1][:, cfg.num_vert:],
+                               prev_heatmap_weighted), dim=1))  # 128 + 42 + 21
+                feat_high_0 = self.extract_high_0[i](feat)  # (batch, 128, 32, 32) >> (batch, 256, 16, 16)
+
+            feat_high = self.extract_high_1[i](feat_high_0) # (batch, 512, 8, 8)
+            init_graph = self.saigb[i](feat_high)  # (batch, 778, 515)
+            coord, lhm, dm = self.gbbmr[i](init_graph)
+
+            outs['coords'].append(coord)  # coord : (batch, 799, 3)      # 799 = num_vert(778) + num_joint(21)
+            lhms.append(lhm)  # lhm : (batch, 799, 32, 32)
+            dms.append(dm)  # dms : (batch, 799, 32, 32)
+
+            joint_lhm = lhm[:, cfg.num_vert:, :, :].clone().detach()
+
+        if self.training:
+            loss = {}
+            mesh_pose_uvd = target['mesh_pose_uvd'].to(cfg.device)
+            weight_sim = target['weight_aug'].to(cfg.device)  # w = 1 if optimal feature(same as currGT), w < 1 as noise scale, ...
+
+            for i in range(cfg.num_stage):
+                loss['coord_{}'.format(i)] = self.coord_loss(outs['coords'][i], mesh_pose_uvd)
+                loss['normal_{}'.format(i)] = \
+                    self.normal_loss(outs['coords'][i][:, :cfg.num_vert], mesh_pose_uvd[:, :cfg.num_vert]).mean() * 0.1
+                loss['edge_{}'.format(i)] = \
+                    self.edge_loss(outs['coords'][i][:, :cfg.num_vert], mesh_pose_uvd[:, :cfg.num_vert]).mean()
+
+            loss['weight'] = self.weight_loss(torch.squeeze(feat_weight), weight_sim)
+            if cfg.flag_vis:
+                visib = input['visible'].to(cfg.device)
+                loss['visib'] = self.weight_loss(torch.squeeze(feat_visib), visib)
+
+            flag_exist = False
+            for i in range(cfg.batch_size):
+                if torch.eq(weight_sim[i], 1.0):
+                    if not flag_exist:
+                        flag_exist = True
+                        loss['heatmap'] = self.heatmap_loss(prev_heatmap[i], joint_lhm[i])
+                    else:
+                        loss['heatmap'] += self.heatmap_loss(prev_heatmap[i], joint_lhm[i])
+            if flag_exist:
+                loss['heatmap'] *= 0.2
+
+            return loss #, outs['coords'][-1]
+
+        else:
+            outs['coords'] = outs['coords'][-1]
+            return outs
 
 
 def get_model():
-    if not cfg.extra:
-        return SAR()
+    if cfg.extra:
+        return SAR_crossWeight_wVis_light()
+        # return SAR_crossWeight()
+        # return SAR_frontWeight()
+        # return SAR_refineWeight()
     else:
-        return SAR_weight_v3()
+        return SAR()
 
 if __name__ == '__main__':
     import torch

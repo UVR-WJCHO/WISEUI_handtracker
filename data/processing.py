@@ -7,6 +7,112 @@ import os
 from PIL import Image
 import time
 
+
+def _2DGaussianKernel(extra_hm):
+    # apply 2D gaussian kernel
+    kernel1d = cv2.getGaussianKernel(5, 5)
+    kernel2d = np.outer(kernel1d, kernel1d.transpose())
+
+    extra_hm = cv2.filter2D(extra_hm, -1, kernel2d)
+    return extra_hm
+
+
+def inference_extraHM(extra_uvd, idx, reinit_num=10):
+    assert extra_uvd.shape[0] == 21
+
+    extra_width = cfg.extra_width
+
+    # re-initialize extra heatmap at every n frames
+    if idx % int(reinit_num) == 0:
+        extra_hm = np.zeros((1, extra_width, extra_width), dtype=np.float32)
+        return extra_hm
+
+    else:
+        extra_hm = np.zeros((extra_width, extra_width), dtype=np.float32)
+        ratio = int(256 / extra_width)
+
+        for i in range(21):
+            u = int(np.clip(extra_uvd[i, 0], 0, 255) / float(ratio))
+            v = int(np.clip(extra_uvd[i, 1], 0, 255) / float(ratio))
+            extra_hm[u, v] = extra_uvd[i, 2]
+
+        extra_hm = _2DGaussianKernel(extra_hm)
+        extra_hm = np.expand_dims(extra_hm, axis=0)
+
+        return extra_hm
+
+
+def generate_extraFeature(curr_uvd, ratio=[0.45, 0.25, 0.1, 0.2], debug=None):
+    flag = int(np.random.choice(4, 1, p=ratio))
+    if flag is 0:
+        extra_uvd = np.copy(curr_uvd)
+        w_aug = 0.0
+    elif flag is 1:
+        extra_uvd, w_aug = generate_fake_prevpose(curr_uvd, weight=1.0)
+    elif flag is 2:
+        w = np.random.uniform(2.5, 5.)
+        extra_uvd, w_aug = generate_fake_prevpose(curr_uvd, weight=w)
+    else:
+        extra_uvd = np.zeros((21, 3))
+        w_aug = 99.0
+
+    ### debug ###
+    # vis_curr = draw_2d_skeleton(np.copy(debug), curr_uvd)
+    # vis_extra = draw_2d_skeleton(np.copy(debug), extra_uvd)
+    # vis_curr = cv2.resize(vis_curr, dsize=(416, 416), interpolation=cv2.INTER_CUBIC)
+    # vis_extra = cv2.resize(vis_extra, dsize=(416, 416), interpolation=cv2.INTER_CUBIC)
+    # cv2.imshow("vis_curr", vis_curr)
+    # cv2.imshow("vis_extra", vis_extra)
+    # cv2.waitKey(0)
+
+    extra_width = cfg.extra_width
+    ratio = int(256. / extra_width)
+
+    extra_hm = np.zeros((extra_width, extra_width), dtype=np.float32)
+    extra_uvd_hm = np.copy(extra_uvd)
+    # extra_hm = np.zeros((128, 128), dtype=np.float32)
+    for i in range(21):
+        u = int(np.clip(extra_uvd_hm[i, 0], 0, 255) / float(ratio))
+        v = int(np.clip(extra_uvd_hm[i, 1], 0, 255) / float(ratio))
+        extra_hm[u, v] = extra_uvd_hm[i, 2]
+
+    extra_hm = _2DGaussianKernel(extra_hm)
+
+    extra_hm = np.expand_dims(extra_hm, axis=0)
+
+    # w = 0 if optimal feature, w = 1~2.5 as noise scale, ...
+    w_aug = 1.0 / (w_aug * 1.5 + 1.0)
+
+    return extra_uvd, extra_hm, w_aug
+
+
+def generate_fake_prevpose(joint_uvd, weight=1.0):
+    # (21, 3), uv range : (0~256), d range : (-0.10 ~ 0.10)
+
+    extra_uvd = np.copy(joint_uvd)
+    extra_uvd = random_translate_pose(extra_uvd, weight=weight)
+
+    noise_w = weight / 2.0
+    ref_value = 5.0
+    extra_uvd[:, 0] += np.random.normal(-1 * ref_value * noise_w, ref_value * noise_w, 21)
+    extra_uvd[:, 1] += np.random.normal(-1 * ref_value * noise_w, ref_value * noise_w, 21)
+    extra_uvd[0:, 2] += np.random.normal(-0.003 * noise_w, 0.003 * noise_w, 21)
+
+    return extra_uvd, weight
+
+
+def random_translate_pose(joint_uvd, weight=1.0):
+    extra_uvd = np.copy(joint_uvd)
+    ref_value = 10.0
+    extra_uvd[:, 0] += np.random.normal(-1 * ref_value * weight, ref_value * weight, 1)
+    extra_uvd[:, 1] += np.random.normal(-1 * ref_value * weight, ref_value * weight, 1)
+    extra_uvd[0:, 2] += np.random.normal(-0.01 * weight, 0.01 * weight, 1)
+
+    return extra_uvd
+
+
+
+
 def cv2pil(cv_img):
     return Image.fromarray(cv2.cvtColor(np.uint8(cv_img), cv2.COLOR_BGR2RGB))
 
